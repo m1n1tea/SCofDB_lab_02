@@ -10,6 +10,7 @@ import pytest
 import uuid
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
 
 from app.application.payment_service import PaymentService
 from app.domain.exceptions import OrderAlreadyPaidError
@@ -18,16 +19,16 @@ from app.domain.exceptions import OrderAlreadyPaidError
 # TODO: Настроить подключение к тестовой БД
 DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/marketplace"
 
+@pytest.fixture
+async def db_engine():
+    engine = create_async_engine(DATABASE_URL, echo=True)
+    yield engine
+    await engine.dispose()
 
 @pytest.fixture
-async def db_session():
-    """
-    Создать сессию БД для тестов.
-    
-    TODO: Реализовать фикстуру (см. test_concurrent_payment_unsafe.py)
-    """
-    # TODO: Реализовать создание сессии
-    raise NotImplementedError("TODO: Реализовать db_session fixture")
+async def db_session(db_engine):
+    async with AsyncSession(db_engine) as session:
+        yield session
 
 
 @pytest.fixture
@@ -35,11 +36,120 @@ async def test_order(db_session):
     """
     Создать тестовый заказ со статусом 'created'.
     
-    TODO: Реализовать фикстуру (см. test_concurrent_payment_unsafe.py)
+    TODO: Реализовать фикстуру:
+    1. Создать тестового пользователя
+    2. Создать тестовый заказ со статусом 'created'
+    3. Записать начальный статус в историю
+    4. Вернуть order_id
+    5. После теста - очистить данные
     """
-    # TODO: Реализовать создание тестового заказа
-    raise NotImplementedError("TODO: Реализовать test_order fixture")
+    user_id = uuid.uuid4()
+    await db_session.execute(
+        text("""
+            INSERT INTO users (id, email, name)
+            VALUES (:id, :email, :name)
+        """),
+        {"id": user_id, "email": f"test_order_{uuid.uuid4()}@example.com", "name": "Test User"}
+    )
 
+    # Создаём заказ
+    order_id = uuid.uuid4()
+    status = 'created'
+    await db_session.execute(
+        text("""
+            INSERT INTO orders (id, user_id, status, total_amount)
+            VALUES (:id, :user_id, :status, 100.00)
+        """),
+        {"id": order_id, "user_id": user_id, "status": status}
+    )
+
+    # Записываем начальный статус в историю
+    await db_session.execute(
+        text("""
+            INSERT INTO order_status_history (id, order_id, status, changed_at)
+            VALUES (gen_random_uuid(), :order_id, :status, NOW())
+        """),
+        {"order_id": order_id, "status": status}
+    )
+
+    await db_session.commit()
+
+    yield order_id
+
+    # Очистка: удаляем заказ (каскадно удалит историю), затем пользователя
+    await db_session.execute(
+        text("DELETE FROM order_status_history WHERE order_id = :order_id"),
+        {"order_id": order_id}
+    )
+    await db_session.execute(
+        text("DELETE FROM orders WHERE id = :order_id"),
+        {"order_id": order_id}
+    )
+    await db_session.execute(
+        text("DELETE FROM users WHERE id = :user_id"),
+        {"user_id": user_id}
+    )
+    await db_session.commit()
+
+@pytest.fixture
+async def test_order2(db_session):
+    """
+    Создать тестовый заказ со статусом 'created'.
+    
+    TODO: Реализовать фикстуру:
+    1. Создать тестового пользователя
+    2. Создать тестовый заказ со статусом 'created'
+    3. Записать начальный статус в историю
+    4. Вернуть order_id
+    5. После теста - очистить данные
+    """
+    user_id = uuid.uuid4()
+    await db_session.execute(
+        text("""
+            INSERT INTO users (id, email, name)
+            VALUES (:id, :email, :name)
+        """),
+        {"id": user_id, "email": f"test_order_{uuid.uuid4()}@example.com", "name": "Test User"}
+    )
+
+    # Создаём заказ
+    order_id = uuid.uuid4()
+    status = 'created'
+    await db_session.execute(
+        text("""
+            INSERT INTO orders (id, user_id, status, total_amount)
+            VALUES (:id, :user_id, :status, 100.00)
+        """),
+        {"id": order_id, "user_id": user_id, "status": status}
+    )
+
+    # Записываем начальный статус в историю
+    await db_session.execute(
+        text("""
+            INSERT INTO order_status_history (id, order_id, status, changed_at)
+            VALUES (gen_random_uuid(), :order_id, :status, NOW())
+        """),
+        {"order_id": order_id, "status": status}
+    )
+
+    await db_session.commit()
+
+    yield order_id
+
+    # Очистка: удаляем заказ (каскадно удалит историю), затем пользователя
+    await db_session.execute(
+        text("DELETE FROM order_status_history WHERE order_id = :order_id"),
+        {"order_id": order_id}
+    )
+    await db_session.execute(
+        text("DELETE FROM orders WHERE id = :order_id"),
+        {"order_id": order_id}
+    )
+    await db_session.execute(
+        text("DELETE FROM users WHERE id = :user_id"),
+        {"user_id": user_id}
+    )
+    await db_session.commit()
 
 @pytest.mark.asyncio
 async def test_concurrent_payment_safe_prevents_race_condition(db_session, test_order):
@@ -95,12 +205,47 @@ async def test_concurrent_payment_safe_prevents_race_condition(db_session, test_
        print(f"  - {history[0]['changed_at']}: status = {history[0]['status']}")
        print(f"Second attempt was rejected: {results[1]}")
     """
-    # TODO: Реализовать тест, демонстрирующий решение race condition
-    raise NotImplementedError("TODO: Реализовать test_concurrent_payment_safe")
+    order_id = test_order
+
+    engine = create_async_engine(DATABASE_URL)
+
+    async def payment_attempt_1():
+        async with AsyncSession(engine) as session1:
+            service = PaymentService(session1)
+            return await service.pay_order_safe(order_id)
+
+    async def payment_attempt_2():
+        async with AsyncSession(engine) as session2:
+            service = PaymentService(session2)
+            return await service.pay_order_safe(order_id)
+
+    results = await asyncio.gather(
+        payment_attempt_1(),
+        payment_attempt_2(),
+        return_exceptions=True
+    )
+
+    success_count = sum(1 for r in results if not isinstance(r, Exception))
+    error_count = sum(1 for r in results if isinstance(r, Exception))
+    
+    assert success_count == 1, "Ожидалась одна успешная оплата"
+    assert error_count == 1, "Ожидалась одна неудачная попытка"
+
+    service = PaymentService(db_session)
+    history = await service.get_payment_history(order_id)
+  
+    assert len(history) == 1, "Ожидалась 1 запись об оплате (БЕЗ RACE CONDITION!)"
+
+    print(f"✅ RACE CONDITION PREVENTED!")
+    print(f"Order {order_id} was paid only ONCE:")
+    print(f"  - {history[0]['changed_at']}: status = {history[0]['status']}")
+    print(f"Second attempt was rejected: {results[1]}")
+
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_concurrent_payment_safe_with_explicit_timing():
+async def test_concurrent_payment_safe_with_explicit_timing(db_session, test_order):
     """
     Дополнительный тест: проверить работу блокировок с явной задержкой.
     
@@ -126,12 +271,48 @@ async def test_concurrent_payment_safe_with_explicit_timing():
        
     Это подтверждает, что FOR UPDATE действительно блокирует строку.
     """
-    # TODO: Реализовать тест с проверкой блокировки
-    raise NotImplementedError("TODO: Реализовать test_concurrent_payment_safe_with_explicit_timing")
+    order_id = test_order
+
+    engine = create_async_engine(DATABASE_URL)
+
+    async def payment_attempt_1():
+        async with AsyncSession(engine) as session1:
+            service = PaymentService(session1)
+            return await service.pay_order_safe_with_sleep(order_id, 1)
+
+    async def payment_attempt_2():
+        async with AsyncSession(engine) as session2:
+            service = PaymentService(session2)
+            await asyncio.sleep(0.1)
+            return await service.pay_order_safe(order_id)
+
+    results = await asyncio.gather(
+        payment_attempt_1(),
+        payment_attempt_2(),
+        return_exceptions=True
+    )
+
+    success_count = sum(1 for r in results if not isinstance(r, Exception))
+    error_count = sum(1 for r in results if isinstance(r, Exception))
+    
+    assert success_count == 1, "Ожидалась одна успешная оплата"
+    assert error_count == 1, "Ожидалась одна неудачная попытка"
+
+    service = PaymentService(db_session)
+    history = await service.get_payment_history(order_id)
+  
+    assert len(history) == 1, "Ожидалась 1 запись об оплате (БЕЗ RACE CONDITION!)"
+
+    print(f"✅ RACE CONDITION PREVENTED!")
+    print(f"Order {order_id} was paid only ONCE:")
+    print(f"  - {history[0]['changed_at']}: status = {history[0]['status']}")
+    print(f"Second attempt was rejected: {results[1]}")
+
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_concurrent_payment_safe_multiple_orders():
+async def test_concurrent_payment_safe_multiple_orders(db_session, test_order, test_order2):
     """
     Дополнительный тест: проверить, что блокировки не мешают разным заказам.
     
@@ -143,9 +324,39 @@ async def test_concurrent_payment_safe_multiple_orders():
     Это показывает, что FOR UPDATE блокирует только конкретную строку,
     а не всю таблицу, что важно для производительности.
     """
-    # TODO: Реализовать тест с несколькими заказами
-    raise NotImplementedError("TODO: Реализовать test_concurrent_payment_safe_multiple_orders")
 
+    order_id1 = test_order
+    order_id2 = test_order2
+    assert order_id1 !=order_id2, "Заказы должны быть разными"
+
+    engine = create_async_engine(DATABASE_URL)
+
+    async def payment_attempt_1():
+        async with AsyncSession(engine) as session1:
+            service = PaymentService(session1)
+            return await service.pay_order_safe(order_id1)
+
+    async def payment_attempt_2():
+        async with AsyncSession(engine) as session2:
+            service = PaymentService(session2)
+            return await service.pay_order_safe(order_id2)
+
+    results = await asyncio.gather(
+        payment_attempt_1(),
+        payment_attempt_2(),
+        return_exceptions=True
+    )
+
+    success_count = sum(1 for r in results if not isinstance(r, Exception))    
+    assert success_count == 2, "Ожидались две успешные оплаты"
+
+    service = PaymentService(db_session)
+    history = await service.get_payment_history(order_id1)
+    assert len(history) == 1, "Ожидалась 1 запись об оплате"
+    history = await service.get_payment_history(order_id2)
+    assert len(history) == 1, "Ожидалась 1 запись об оплате"
+
+    await engine.dispose()
 
 if __name__ == "__main__":
     """
